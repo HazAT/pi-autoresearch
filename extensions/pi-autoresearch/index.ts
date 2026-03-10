@@ -416,8 +416,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return;
       }
 
-      await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
-        return new DashboardComponent(state, theme, () => done());
+      await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+        const dashboard = new DashboardComponent(state, theme, () => done());
+        dashboard.tui = tui;
+        return dashboard;
       });
     },
   });
@@ -433,15 +435,29 @@ class DashboardComponent {
   private onClose: () => void;
   private cachedWidth?: number;
   private cachedLines?: string[];
+  private lastSeenCount: number;
+  private timer: ReturnType<typeof setInterval> | null = null;
+  public tui: any = null;
 
   constructor(state: ExperimentState, theme: Theme, onClose: () => void) {
     this.state = state;
     this.theme = theme;
     this.onClose = onClose;
+    this.lastSeenCount = state.totalExperiments;
+
+    // Poll every 5s — if state changed, invalidate and re-render
+    this.timer = setInterval(() => {
+      if (this.state.totalExperiments !== this.lastSeenCount) {
+        this.lastSeenCount = this.state.totalExperiments;
+        this.invalidate();
+        this.tui?.requestRender?.();
+      }
+    }, 5000);
   }
 
   handleInput(data: string): void {
     if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+      if (this.timer) clearInterval(this.timer);
       this.onClose();
     }
   }
