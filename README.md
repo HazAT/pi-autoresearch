@@ -5,7 +5,7 @@ A [pi](https://github.com/badlogic/pi) extension + skill inspired by [karpathy/a
 ## What's included
 
 ```
-extensions/autoresearch/index.ts   — pi extension (tools + widget + dashboard)
+extensions/pi-autoresearch/index.ts   — pi extension (tools + widget + dashboard)
 skills/autoresearch-create/SKILL.md — meta-skill to generate domain-specific skills
 ```
 
@@ -28,7 +28,7 @@ Copy into your pi agent directory:
 
 ```bash
 # Extension
-cp -r extensions/autoresearch ~/.pi/agent/extensions/
+cp -r extensions/pi-autoresearch ~/.pi/agent/extensions/
 
 # Skill
 cp -r skills/autoresearch-create ~/.pi/agent/skills/
