@@ -113,13 +113,6 @@ const InitParams = Type.Object({
         'Whether "lower" or "higher" is better for the primary metric. Default: "lower".',
     })
   ),
-  max_experiments: Type.Optional(
-    Type.Integer({
-      description:
-        "Maximum number of experiments (including the baseline run) before auto-stopping. Omit for unlimited.",
-      minimum: 1,
-    })
-  ),
 });
 
 const LogParams = Type.Object({
@@ -190,6 +183,20 @@ function isBetter(
 /** Get results in the current segment only */
 function currentResults(results: ExperimentResult[], segment: number): ExperimentResult[] {
   return results.filter((r) => r.segment === segment);
+}
+
+/** Read maxExperiments from autoresearch.config.json (if it exists) */
+function readMaxExperiments(cwd: string): number | null {
+  try {
+    const configPath = path.join(cwd, "autoresearch.config.json");
+    if (!fs.existsSync(configPath)) return null;
+    const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    return (typeof config.maxIterations === "number" && config.maxIterations > 0)
+      ? Math.floor(config.maxIterations)
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Baseline = first experiment in current segment */
@@ -534,7 +541,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               if (entry.metricName) state.metricName = entry.metricName;
               if (entry.metricUnit !== undefined) state.metricUnit = entry.metricUnit;
               if (entry.bestDirection) state.bestDirection = entry.bestDirection;
-              state.maxExperiments = (typeof entry.maxExperiments === "number" && entry.maxExperiments > 0) ? entry.maxExperiments : null;
               // Increment segment (first config = 0, second = 1, etc.)
               if (state.results.length > 0) segment++;
               state.currentSegment = segment;
@@ -595,6 +601,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
     }
+
+    // Read max experiments from config file
+    state.maxExperiments = readMaxExperiments(ctx.cwd);
 
     // Also detect autoresearch mode from file presence
     if (fs.existsSync(path.join(ctx.cwd, "autoresearch.md"))) {
@@ -771,12 +780,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (params.direction === "lower" || params.direction === "higher") {
         state.bestDirection = params.direction;
       }
-      state.maxExperiments = params.max_experiments ?? null;
-
       // Reset results for new baseline segment
       state.results = [];
       state.bestMetric = null;
       state.secondaryMetrics = [];
+
+      // Read max experiments from config file
+      state.maxExperiments = readMaxExperiments(ctx.cwd);
 
       // Write config header to jsonl (append for re-init, create for first)
       try {
@@ -787,7 +797,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           metricName: state.metricName,
           metricUnit: state.metricUnit,
           bestDirection: state.bestDirection,
-          maxExperiments: state.maxExperiments,
         });
         if (isReinit) {
           fs.appendFileSync(jsonlPath, config + "\n");
@@ -808,7 +817,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       updateWidget(ctx);
 
       const reinitNote = isReinit ? " (re-initialized — previous results archived, new baseline needed)" : "";
-      const limitNote = state.maxExperiments !== null ? `\nMax experiments: ${state.maxExperiments}` : "";
+      const limitNote = state.maxExperiments !== null ? `\nMax iterations: ${state.maxExperiments} (from autoresearch.config.json)` : "";
       return {
         content: [{
           type: "text",
