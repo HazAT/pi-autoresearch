@@ -57,6 +57,8 @@ interface ExperimentState {
   name: string | null;
   /** Current segment index (incremented on each init_experiment) */
   currentSegment: number;
+  /** Maximum number of experiments before auto-stopping. null = unlimited. */
+  maxExperiments: number | null;
 }
 
 interface RunDetails {
@@ -192,6 +194,20 @@ function isBetter(
 /** Get results in the current segment only */
 function currentResults(results: ExperimentResult[], segment: number): ExperimentResult[] {
   return results.filter((r) => r.segment === segment);
+}
+
+/** Read maxExperiments from autoresearch.config.json (if it exists) */
+function readMaxExperiments(cwd: string): number | null {
+  try {
+    const configPath = path.join(cwd, "autoresearch.config.json");
+    if (!fs.existsSync(configPath)) return null;
+    const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    return (typeof config.maxIterations === "number" && config.maxIterations > 0)
+      ? Math.floor(config.maxIterations)
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Baseline = first experiment in current segment */
@@ -513,6 +529,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     secondaryMetrics: [],
     name: null,
     currentSegment: 0,
+    maxExperiments: null,
   };
 
   const autoresearchHelp = () =>
@@ -546,6 +563,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       secondaryMetrics: [],
       name: null,
       currentSegment: 0,
+      maxExperiments: null,
     };
 
     // Primary: read from autoresearch.jsonl (alongside autoresearch.md/sh)
@@ -625,6 +643,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
     }
+
+
+    // Read max experiments from config file
+    state.maxExperiments = readMaxExperiments(ctx.cwd);
 
     // Auto-enter autoresearch mode only when a persisted experiment log exists
     autoresearchMode = fs.existsSync(path.join(ctx.cwd, "autoresearch.jsonl"));
@@ -862,11 +884,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (params.direction === "lower" || params.direction === "higher") {
         state.bestDirection = params.direction;
       }
-
       // Reset results for new baseline segment
       state.results = [];
       state.bestMetric = null;
       state.secondaryMetrics = [];
+
+      // Read max experiments from config file
+      state.maxExperiments = readMaxExperiments(ctx.cwd);
 
       // Write config header to jsonl (append for re-init, create for first)
       try {
@@ -897,10 +921,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       updateWidget(ctx);
 
       const reinitNote = isReinit ? " (re-initialized — previous results archived, new baseline needed)" : "";
+      const limitNote = state.maxExperiments !== null ? `\nMax iterations: ${state.maxExperiments} (from autoresearch.config.json)` : "";
       return {
         content: [{
           type: "text",
-          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)\nConfig written to autoresearch.jsonl. Now run the baseline with run_experiment.`,
+          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}\nConfig written to autoresearch.jsonl. Now run the baseline with run_experiment.`,
         }],
         details: { state: { ...state } },
       };
@@ -936,6 +961,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     parameters: RunParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      // Block if max experiments limit already reached
+      if (state.maxExperiments !== null) {
+        const segCount = currentResults(state.results, state.currentSegment).length;
+        if (segCount >= state.maxExperiments) {
+          return {
+            content: [{ type: "text", text: `🛑 Maximum experiments reached (${state.maxExperiments}). The experiment loop is done. To continue, call init_experiment to start a new segment.` }],
+            details: {},
+          };
+        }
+      }
+
       const timeout = (params.timeout_seconds ?? 600) * 1000;
 
       runningExperiment = { startedAt: Date.now(), command: params.command };
@@ -1225,12 +1261,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
 
       // Build response text
-      const curCount = currentResults(state.results, state.currentSegment).length;
+      const segmentCount = currentResults(state.results, state.currentSegment).length;
       let text = `Logged #${state.results.length}: ${experiment.status} — ${experiment.description}`;
 
       if (state.bestMetric !== null) {
         text += `\nBaseline ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}`;
-        if (curCount > 1 && params.status === "keep" && params.metric > 0) {
+        if (segmentCount > 1 && params.status === "keep" && params.metric > 0) {
           const delta = params.metric - state.bestMetric;
           const pct = ((delta / state.bestMetric) * 100).toFixed(1);
           const sign = delta > 0 ? "+" : "";
@@ -1258,7 +1294,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += `\nSecondary: ${parts.join("  ")}`;
       }
 
-      text += `\n(${state.results.length} experiments total)`;
+      text += `\n(${segmentCount} experiments`;
+      if (state.maxExperiments !== null) {
+        text += ` / ${state.maxExperiments} max`;
+      }
+      text += `)`;
 
       // Auto-commit only on keep — discards/crashes get reverted anyway
       if (params.status === "keep") {
@@ -1316,6 +1356,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Clear running experiment and checks state (log_experiment consumes the run)
       runningExperiment = null;
       lastRunChecks = null;
+
+      // Check if max experiments limit reached
+      const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
+      if (limitReached) {
+        text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
+        autoresearchMode = false;
+      }
 
       updateWidget(ctx);
 
