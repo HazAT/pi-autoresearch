@@ -196,18 +196,59 @@ function currentResults(results: ExperimentResult[], segment: number): Experimen
   return results.filter((r) => r.segment === segment);
 }
 
-/** Read maxExperiments from autoresearch.config.json (if it exists) */
-function readMaxExperiments(cwd: string): number | null {
+interface AutoresearchConfig {
+  maxIterations?: number;
+  workingDir?: string;
+}
+
+/** Read autoresearch.config.json from the given directory (always ctx.cwd) */
+function readConfig(cwd: string): AutoresearchConfig {
   try {
     const configPath = path.join(cwd, "autoresearch.config.json");
-    if (!fs.existsSync(configPath)) return null;
-    const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    return (typeof config.maxIterations === "number" && config.maxIterations > 0)
-      ? Math.floor(config.maxIterations)
-      : null;
+    if (!fs.existsSync(configPath)) return {};
+    return JSON.parse(fs.readFileSync(configPath, "utf-8"));
   } catch {
-    return null;
+    return {};
   }
+}
+
+/** Read maxExperiments from autoresearch.config.json (if it exists) */
+function readMaxExperiments(cwd: string): number | null {
+  const config = readConfig(cwd);
+  return (typeof config.maxIterations === "number" && config.maxIterations > 0)
+    ? Math.floor(config.maxIterations)
+    : null;
+}
+
+/**
+ * Resolve the effective working directory.
+ * Reads workingDir from autoresearch.config.json in ctxCwd.
+ * Returns ctxCwd if not set. Supports relative (resolved against ctxCwd) and absolute paths.
+ */
+function resolveWorkDir(ctxCwd: string): string {
+  const config = readConfig(ctxCwd);
+  if (!config.workingDir) return ctxCwd;
+  return path.isAbsolute(config.workingDir)
+    ? config.workingDir
+    : path.resolve(ctxCwd, config.workingDir);
+}
+
+/**
+ * Validate that the resolved working directory exists.
+ * Returns an error message if it doesn't exist, or null if OK.
+ */
+function validateWorkDir(ctxCwd: string): string | null {
+  const workDir = resolveWorkDir(ctxCwd);
+  if (workDir === ctxCwd) return null;
+  try {
+    const stat = fs.statSync(workDir);
+    if (!stat.isDirectory()) {
+      return `workingDir "${workDir}" (from autoresearch.config.json) is not a directory.`;
+    }
+  } catch {
+    return `workingDir "${workDir}" (from autoresearch.config.json) does not exist.`;
+  }
+  return null;
 }
 
 /** Baseline = first experiment in current segment */
@@ -566,8 +607,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       maxExperiments: null,
     };
 
+    // Resolve effective working directory (config stays in ctx.cwd, files in workDir)
+    const workDir = resolveWorkDir(ctx.cwd);
+
     // Primary: read from autoresearch.jsonl (alongside autoresearch.md/sh)
-    const jsonlPath = path.join(ctx.cwd, "autoresearch.jsonl");
+    const jsonlPath = path.join(workDir, "autoresearch.jsonl");
     let loadedFromJsonl = false;
     try {
       if (fs.existsSync(jsonlPath)) {
@@ -649,7 +693,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     state.maxExperiments = readMaxExperiments(ctx.cwd);
 
     // Auto-enter autoresearch mode only when a persisted experiment log exists
-    autoresearchMode = fs.existsSync(path.join(ctx.cwd, "autoresearch.jsonl"));
+    autoresearchMode = fs.existsSync(path.join(workDir, "autoresearch.jsonl"));
 
     updateWidget(ctx);
   };
@@ -804,7 +848,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     // Auto-continue: send a message to resume the loop
     // The agent reads autoresearch.md on startup which has all context
-    const ideasPath = path.join(ctx.cwd, "autoresearch.ideas.md");
+    const workDir = resolveWorkDir(ctx.cwd);
+    const ideasPath = path.join(workDir, "autoresearch.ideas.md");
     const hasIdeas = fs.existsSync(ideasPath);
 
     let resumeMsg = "Autoresearch loop ended (likely context limit). Resume the experiment loop — read autoresearch.md and git log for context.";
@@ -822,11 +867,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     if (!autoresearchMode) return;
 
-    const mdPath = path.join(ctx.cwd, "autoresearch.md");
-    const ideasPath = path.join(ctx.cwd, "autoresearch.ideas.md");
+    const workDir = resolveWorkDir(ctx.cwd);
+    const mdPath = path.join(workDir, "autoresearch.md");
+    const ideasPath = path.join(workDir, "autoresearch.ideas.md");
     const hasIdeas = fs.existsSync(ideasPath);
 
-    const checksPath = path.join(ctx.cwd, "autoresearch.checks.sh");
+    const checksPath = path.join(workDir, "autoresearch.checks.sh");
     const hasChecks = fs.existsSync(checksPath);
 
     let extra =
@@ -876,6 +922,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     parameters: InitParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      // Validate working directory exists
+      const workDirError = validateWorkDir(ctx.cwd);
+      if (workDirError) {
+        return {
+          content: [{ type: "text", text: `❌ ${workDirError}` }],
+          details: {},
+        };
+      }
+
       const isReinit = state.results.length > 0;
 
       state.name = params.name;
@@ -889,12 +944,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       state.bestMetric = null;
       state.secondaryMetrics = [];
 
-      // Read max experiments from config file
+      // Read max experiments from config file (config always in ctx.cwd)
       state.maxExperiments = readMaxExperiments(ctx.cwd);
 
       // Write config header to jsonl (append for re-init, create for first)
+      const workDir = resolveWorkDir(ctx.cwd);
       try {
-        const jsonlPath = path.join(ctx.cwd, "autoresearch.jsonl");
+        const jsonlPath = path.join(workDir, "autoresearch.jsonl");
         const config = JSON.stringify({
           type: "config",
           name: state.name,
@@ -922,10 +978,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       const reinitNote = isReinit ? " (re-initialized — previous results archived, new baseline needed)" : "";
       const limitNote = state.maxExperiments !== null ? `\nMax iterations: ${state.maxExperiments} (from autoresearch.config.json)` : "";
+      const workDirNote = workDir !== ctx.cwd ? `\nWorking directory: ${workDir}` : "";
       return {
         content: [{
           type: "text",
-          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}\nConfig written to autoresearch.jsonl. Now run the baseline with run_experiment.`,
+          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}\nConfig written to autoresearch.jsonl. Now run the baseline with run_experiment.`,
         }],
         details: { state: { ...state } },
       };
@@ -961,6 +1018,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     parameters: RunParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      // Validate working directory exists
+      const workDirError = validateWorkDir(ctx.cwd);
+      if (workDirError) {
+        return {
+          content: [{ type: "text", text: `❌ ${workDirError}` }],
+          details: {},
+        };
+      }
+      const workDir = resolveWorkDir(ctx.cwd);
+
       // Block if max experiments limit already reached
       if (state.maxExperiments !== null) {
         const segCount = currentResults(state.results, state.currentSegment).length;
@@ -989,7 +1056,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         result = await pi.exec("bash", ["-c", params.command], {
           signal,
           timeout,
-          cwd: ctx.cwd,
+          cwd: workDir,
         });
       } finally {
         runningExperiment = null;
@@ -1006,7 +1073,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       let checksOutput = "";
       let checksDuration = 0;
 
-      const checksPath = path.join(ctx.cwd, "autoresearch.checks.sh");
+      const checksPath = path.join(workDir, "autoresearch.checks.sh");
       if (benchmarkPassed && fs.existsSync(checksPath)) {
         const checksTimeout = (params.checks_timeout_seconds ?? 300) * 1000;
         const ct0 = Date.now();
@@ -1014,7 +1081,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const checksResult = await pi.exec("bash", [checksPath], {
             signal,
             timeout: checksTimeout,
-            cwd: ctx.cwd,
+            cwd: workDir,
           });
           checksDuration = (Date.now() - ct0) / 1000;
           checksTimedOut = !!checksResult.killed;
@@ -1190,6 +1257,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     parameters: LogParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      // Validate working directory exists
+      const workDirError = validateWorkDir(ctx.cwd);
+      if (workDirError) {
+        return {
+          content: [{ type: "text", text: `❌ ${workDirError}` }],
+          details: {},
+        };
+      }
+      const workDir = resolveWorkDir(ctx.cwd);
       const secondaryMetrics = params.metrics ?? {};
 
       // Gate: prevent "keep" when last run's checks failed
@@ -1313,7 +1389,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
           const gitResult = await pi.exec("bash", ["-c",
             `git add -A && git diff --cached --quiet && echo "NOTHING_TO_COMMIT" || git commit -m ${JSON.stringify(commitMsg)}`
-          ], { cwd: ctx.cwd, timeout: 10000 });
+          ], { cwd: workDir, timeout: 10000 });
 
           const gitOutput = (gitResult.stdout + gitResult.stderr).trim();
           if (gitOutput.includes("NOTHING_TO_COMMIT")) {
@@ -1324,7 +1400,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
             // Update experiment record with the actual new commit hash
             try {
-              const shaResult = await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: ctx.cwd, timeout: 5000 });
+              const shaResult = await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: workDir, timeout: 5000 });
               const newSha = (shaResult.stdout || "").trim();
               if (newSha && newSha.length >= 7) {
                 experiment.commit = newSha;
@@ -1344,7 +1420,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Persist to autoresearch.jsonl AFTER git commit (so commit hash is correct)
       try {
-        const jsonlPath = path.join(ctx.cwd, "autoresearch.jsonl");
+        const jsonlPath = path.join(workDir, "autoresearch.jsonl");
         fs.appendFileSync(jsonlPath, JSON.stringify({
           run: state.results.length,
           ...experiment,
@@ -1441,7 +1517,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     description: "Toggle autoresearch dashboard",
     handler: async (ctx) => {
       if (state.results.length === 0) {
-        if (!autoresearchMode && !fs.existsSync(path.join(ctx.cwd, "autoresearch.md"))) {
+        if (!autoresearchMode && !fs.existsSync(path.join(resolveWorkDir(ctx.cwd), "autoresearch.md"))) {
           ctx.ui.notify("No experiments yet — run /autoresearch to get started", "info");
         } else {
           ctx.ui.notify("No experiments yet", "info");
@@ -1632,7 +1708,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       if (command === "clear") {
-        const jsonlPath = path.join(ctx.cwd, "autoresearch.jsonl");
+        const jsonlPath = path.join(resolveWorkDir(ctx.cwd), "autoresearch.jsonl");
         autoresearchMode = false;
         autoResumeTurns = 0;
         experimentsThisSession = 0;
@@ -1660,7 +1736,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       autoresearchMode = true;
       autoResumeTurns = 0;
 
-      const mdPath = path.join(ctx.cwd, "autoresearch.md");
+      const mdPath = path.join(resolveWorkDir(ctx.cwd), "autoresearch.md");
       const hasRules = fs.existsSync(mdPath);
 
       if (hasRules) {
