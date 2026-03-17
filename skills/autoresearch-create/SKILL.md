@@ -95,18 +95,31 @@ pnpm test --run --reporter=dot 2>&1 | tail -50
 pnpm typecheck 2>&1 | grep -i error || true
 ```
 
+## Architecture: Orchestrator + Workers
+
+Autoresearch runs via **subagent workers**. The parent session (orchestrator) spawns autonomous worker subagents using the `autoresearch` agent definition. Each worker:
+
+1. Gets a fresh context window (Opus 4.6, medium thinking)
+2. Reads `autoresearch.md` + git log for full context
+3. Runs a batch of experiments (default 10, configurable via `experimentsPerWorker` in config)
+4. Updates `autoresearch.md` "What's Been Tried" and `autoresearch.ideas.md`
+5. Self-terminates via `subagent_done`
+
+The orchestrator then spawns the next worker. This gives unlimited experiment runs with fresh thinking each batch.
+
+**Setup happens in the orchestrator** (creating files, initial commit). Once setup is done, the orchestrator spawns the first worker and enters the spawn loop.
+
 ## Loop Rules
 
-**LOOP FOREVER.** Never ask "should I continue?" — the user expects autonomous work.
+Workers follow these rules during their batch:
 
 - **Primary metric is king.** Improved → `keep`. Worse/equal → `discard`. Secondary metrics rarely affect this.
 - **Simpler is better.** Removing code for equal perf = keep. Ugly complexity for tiny gain = probably discard.
 - **Don't thrash.** Repeatedly reverting the same idea? Try something structurally different.
 - **Crashes:** fix if trivial, otherwise log and move on. Don't over-invest.
 - **Think longer when stuck.** Re-read source files, study the profiling data, reason about what the CPU is actually doing. The best ideas come from deep understanding, not from trying random variations.
+- **Swing wild sometimes.** Every ~5th experiment should be a high-risk creative bet — different algorithm, radical simplification, cross-domain idea. Most will be discarded. One breakthrough is worth it.
 - **Resuming:** if `autoresearch.md` exists, read it + git log, continue looping.
-
-**NEVER STOP.** The user may be away for hours. Keep going until interrupted.
 
 ## Ideas Backlog
 

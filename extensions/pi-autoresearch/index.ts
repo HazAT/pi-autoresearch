@@ -91,6 +91,8 @@ interface AutoresearchRuntime {
   lastRunChecks: { pass: boolean; output: string; duration: number } | null;
   runningExperiment: { startedAt: number; command: string } | null;
   state: ExperimentState;
+  /** True in the parent session that orchestrates workers via subagents */
+  isOrchestrator: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +213,7 @@ function currentResults(results: ExperimentResult[], segment: number): Experimen
 interface AutoresearchConfig {
   maxIterations?: number;
   workingDir?: string;
+  experimentsPerWorker?: number;
 }
 
 /** Read autoresearch.config.json from the given directory (always ctx.cwd) */
@@ -342,6 +345,7 @@ function createSessionRuntime(): AutoresearchRuntime {
     lastRunChecks: null,
     runningExperiment: null,
     state: createExperimentState(),
+    isOrchestrator: false,
   };
 }
 
@@ -919,7 +923,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     getRuntime(ctx).experimentsThisSession = 0;
   });
 
-  // Clear running experiment state when agent stops; check ideas file for continuation
+  // Clear running experiment state when agent stops; orchestrator spawns next worker
   pi.on("agent_end", async (_event, ctx) => {
     const runtime = getRuntime(ctx);
     runtime.runningExperiment = null;
@@ -927,8 +931,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     if (!runtime.autoresearchMode) return;
 
-    // Don't auto-resume if no experiments ran this session (user likely stopped manually)
-    if (runtime.experimentsThisSession === 0) return;
+    // Only orchestrator sessions auto-resume (workers self-terminate via subagent_done)
+    if (!runtime.isOrchestrator) return;
 
     // Rate-limit auto-resume to once every 5 minutes
     const now = Date.now();
@@ -943,20 +947,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return;
     }
 
-    // Auto-continue: send a message to resume the loop
-    // The agent reads autoresearch.md on startup which has all context
+    // Check if max experiments already reached
     const workDir = resolveWorkDir(ctx.cwd);
-    const ideasPath = path.join(workDir, "autoresearch.ideas.md");
-    const hasIdeas = fs.existsSync(ideasPath);
-
-    let resumeMsg = "Autoresearch loop ended (likely context limit). Resume the experiment loop — read autoresearch.md and git log for context.";
-    if (hasIdeas) {
-      resumeMsg += " Check autoresearch.ideas.md for promising paths to explore. Prune stale/tried ideas.";
+    const state = runtime.state;
+    if (state.maxExperiments !== null) {
+      const segCount = currentResults(state.results, state.currentSegment).length;
+      if (segCount >= state.maxExperiments) return;
     }
-    resumeMsg += ` ${BENCHMARK_GUARDRAIL}`;
 
     runtime.autoResumeTurns++;
-    pi.sendUserMessage(resumeMsg);
+    pi.sendUserMessage(
+      `Autoresearch orchestration resumed (likely context limit). Spawn the next autoresearch worker to continue experiments. ${BENCHMARK_GUARDRAIL}`
+    );
   });
 
   // When in autoresearch mode, add a static note to the system prompt.
@@ -973,23 +975,57 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const checksPath = path.join(workDir, "autoresearch.checks.sh");
     const hasChecks = fs.existsSync(checksPath);
 
-    let extra =
-      "\n\n## Autoresearch Mode (ACTIVE)" +
-      "\nYou are in autoresearch mode. Optimize the primary metric through an autonomous experiment loop." +
-      "\nUse init_experiment, run_experiment, and log_experiment tools. NEVER STOP until interrupted." +
-      `\nExperiment rules: ${mdPath} — read this file at the start of every session and after compaction.` +
-      "\nWrite promising but deferred optimizations as bullet points to autoresearch.ideas.md — don't let good ideas get lost." +
-      `\n${BENCHMARK_GUARDRAIL}` +
-      "\nIf the user sends a follow-on message while an experiment is running, finish the current run_experiment + log_experiment cycle first, then address their message in the next iteration.";
+    let extra = "";
 
-    if (hasChecks) {
-      extra +=
-        "\n\n## Backpressure Checks (ACTIVE)" +
-        `\n${checksPath} exists and runs automatically after every passing benchmark in run_experiment.` +
-        "\nIf the benchmark passes but checks fail, run_experiment will report it clearly." +
-        "\nUse status 'checks_failed' in log_experiment when this happens — it behaves like a crash (no commit, changes auto-reverted)." +
-        "\nYou cannot use status 'keep' when checks have failed." +
-        "\nThe checks execution time does NOT affect the primary metric.";
+    if (runtime.isOrchestrator) {
+      // Orchestrator: spawns worker subagents, doesn't run experiments directly
+      const state = runtime.state;
+      const segCount = currentResults(state.results, state.currentSegment).length;
+      const config = readConfig(ctx.cwd);
+      const batchSize = config.experimentsPerWorker ?? 10;
+
+      extra =
+        "\n\n## Autoresearch Mode (ACTIVE — Orchestrator)" +
+        "\nYou orchestrate autoresearch by spawning worker subagents. Do NOT run experiments yourself." +
+        `\nExperiment rules: ${mdPath}` +
+        `\n${BENCHMARK_GUARDRAIL}` +
+        "\n\n### How to spawn a worker" +
+        "\nUse the subagent tool with agent 'autoresearch':" +
+        '\n```' +
+        `\nsubagent({ name: "Autoresearch", agent: "autoresearch", interactive: false, task: "Run autoresearch experiments. Read autoresearch.md for full context, git log --oneline -20 for recent history. ${BENCHMARK_GUARDRAIL}" })` +
+        '\n```' +
+        `\nEach worker runs up to ${batchSize} experiments, then self-terminates.` +
+        "\nWhen a worker completes, review its summary and spawn the next worker." +
+        "\nContinue spawning workers until /autoresearch off or the experiment limit is reached." +
+        `\n\nCurrent progress: ${segCount} experiments` +
+        (state.maxExperiments !== null ? ` / ${state.maxExperiments} max` : "") +
+        (state.bestMetric !== null ? ` | best ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}` : "") +
+        ".";
+
+      if (state.maxExperiments !== null && segCount >= state.maxExperiments) {
+        extra += "\n\n🛑 Maximum experiments reached — do NOT spawn more workers.";
+      }
+    } else {
+      // Worker (or legacy direct mode): runs experiments directly
+      extra =
+        "\n\n## Autoresearch Mode (ACTIVE)" +
+        "\nYou are in autoresearch mode. Optimize the primary metric through an autonomous experiment loop." +
+        "\nUse init_experiment, run_experiment, and log_experiment tools. NEVER STOP until the batch limit is reached." +
+        `\nExperiment rules: ${mdPath} — read this file at the start of every session and after compaction.` +
+        "\nWrite promising but deferred optimizations as bullet points to autoresearch.ideas.md — don't let good ideas get lost." +
+        `\n${BENCHMARK_GUARDRAIL}` +
+        "\nIf the user sends a follow-on message while an experiment is running, finish the current run_experiment + log_experiment cycle first, then address their message in the next iteration." +
+        "\nWhen log_experiment tells you the batch is complete, follow its wrap-up instructions and call subagent_done.";
+
+      if (hasChecks) {
+        extra +=
+          "\n\n## Backpressure Checks (ACTIVE)" +
+          `\n${checksPath} exists and runs automatically after every passing benchmark in run_experiment.` +
+          "\nIf the benchmark passes but checks fail, run_experiment will report it clearly." +
+          "\nUse status 'checks_failed' in log_experiment when this happens — it behaves like a crash (no commit, changes auto-reverted)." +
+          "\nYou cannot use status 'keep' when checks have failed." +
+          "\nThe checks execution time does NOT affect the primary metric.";
+      }
     }
 
     if (hasIdeas) {
@@ -1559,11 +1595,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       runtime.runningExperiment = null;
       runtime.lastRunChecks = null;
 
-      // Check if max experiments limit reached
+      // Check if max experiments limit reached (global limit)
       const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
       if (limitReached) {
         text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
         runtime.autoresearchMode = false;
+      }
+
+      // Check batch limit for worker subagents (per-worker limit)
+      if (!limitReached) {
+        const config = readConfig(ctx.cwd);
+        const batchLimit = config.experimentsPerWorker ?? 10;
+        if (runtime.experimentsThisSession >= batchLimit) {
+          text += `\n\n🔄 Batch complete (${batchLimit} experiments). Time to wrap up:` +
+            "\n1. Update autoresearch.md — add key findings to 'What's Been Tried'" +
+            "\n2. Write promising untried ideas to autoresearch.ideas.md" +
+            "\n3. Call subagent_done with a summary of this batch (what you tried, what worked, current best)";
+        }
       }
 
       updateWidget(ctx);
@@ -1869,18 +1917,26 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       runtime.autoresearchMode = true;
+      runtime.isOrchestrator = true;
       runtime.autoResumeTurns = 0;
+
+      // Refresh state from jsonl so dashboard and system prompt have fresh data
+      reconstructState(ctx);
+      runtime.autoresearchMode = true;
+      runtime.isOrchestrator = true;
 
       const mdPath = path.join(resolveWorkDir(ctx.cwd), "autoresearch.md");
       const hasRules = fs.existsSync(mdPath);
 
       if (hasRules) {
-        ctx.ui.notify("Autoresearch mode ON — rules loaded from autoresearch.md", "info");
-        pi.sendUserMessage(`Autoresearch mode active. ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`);
-      } else {
-        ctx.ui.notify("Autoresearch mode ON — no autoresearch.md found, setting up", "info");
+        ctx.ui.notify("Autoresearch mode ON — orchestrating workers", "info");
         pi.sendUserMessage(
-          `Start autoresearch: ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`
+          `Resume autoresearch: ${trimmedArgs}. Spawn an autoresearch worker subagent to continue the experiment loop. ${BENCHMARK_GUARDRAIL}`
+        );
+      } else {
+        ctx.ui.notify("Autoresearch mode ON — setting up, then spawning workers", "info");
+        pi.sendUserMessage(
+          `Start autoresearch: ${trimmedArgs}. Set up the experiment infrastructure first (use autoresearch-create skill to create autoresearch.md, autoresearch.sh, and the initial commit), then spawn an autoresearch worker subagent to start experimenting. ${BENCHMARK_GUARDRAIL}`
         );
       }
     },
