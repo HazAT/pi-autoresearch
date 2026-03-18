@@ -46,6 +46,15 @@ interface MetricDef {
   unit: string;
 }
 
+/** Accumulated cost/token usage across all autoresearch sessions */
+interface CostSummary {
+  totalCost: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+}
+
 interface ExperimentState {
   results: ExperimentResult[];
   /** Baseline primary metric (from first experiment in current segment) */
@@ -60,6 +69,8 @@ interface ExperimentState {
   currentSegment: number;
   /** Maximum number of experiments before auto-stopping. null = unlimited. */
   maxExperiments: number | null;
+  /** Accumulated costs from all worker sessions */
+  costs: CostSummary;
 }
 
 interface RunDetails {
@@ -318,7 +329,53 @@ function cloneExperimentState(state: ExperimentState): ExperimentState {
       metrics: { ...result.metrics },
     })),
     secondaryMetrics: state.secondaryMetrics.map((metric) => ({ ...metric })),
+    costs: { ...state.costs },
   };
+}
+
+/** Compute cost summary from session entries by summing assistant message usage */
+function computeCostsFromEntries(entries: Array<{ type: string; message?: any }>): CostSummary {
+  const costs = createCostSummary();
+  for (const entry of entries) {
+    if (entry.type !== "message") continue;
+    const msg = entry.message;
+    if (msg?.role !== "assistant" || !msg.usage) continue;
+    const u = msg.usage;
+    costs.inputTokens += u.input ?? 0;
+    costs.outputTokens += u.output ?? 0;
+    costs.cacheReadTokens += u.cacheRead ?? 0;
+    costs.cacheWriteTokens += u.cacheWrite ?? 0;
+    costs.totalCost += u.cost?.total ?? 0;
+  }
+  return costs;
+}
+
+/** Add two cost summaries together */
+function addCosts(a: CostSummary, b: CostSummary): CostSummary {
+  return {
+    totalCost: a.totalCost + b.totalCost,
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
+    cacheWriteTokens: a.cacheWriteTokens + b.cacheWriteTokens,
+  };
+}
+
+/** Format a dollar amount: $0.42, $1.23, $12.50 */
+function formatCost(cost: number): string {
+  if (cost < 0.01) return `$${cost.toFixed(4)}`;
+  return `$${cost.toFixed(2)}`;
+}
+
+/** Format token count in compact form: 1.2k, 45.3k, 1.2M */
+function formatTokens(n: number): string {
+  if (n < 1000) return String(Math.round(n));
+  if (n < 1_000_000) return (n / 1000).toFixed(1) + "k";
+  return (n / 1_000_000).toFixed(1) + "M";
+}
+
+function createCostSummary(): CostSummary {
+  return { totalCost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
 }
 
 function createExperimentState(): ExperimentState {
@@ -332,6 +389,7 @@ function createExperimentState(): ExperimentState {
     name: null,
     currentSegment: 0,
     maxExperiments: null,
+    costs: createCostSummary(),
   };
 }
 
@@ -519,6 +577,18 @@ function renderDashboardLines(
         );
       }
     }
+  }
+
+  // Cost summary line
+  if (st.costs.totalCost > 0) {
+    const totalTokens = st.costs.inputTokens + st.costs.outputTokens + st.costs.cacheReadTokens + st.costs.cacheWriteTokens;
+    let costLine = `  ${th.fg("muted", "Cost:")}    ${th.fg("text", formatCost(st.costs.totalCost))}`;
+    costLine += th.fg("dim", `  ${formatTokens(totalTokens)} tokens`);
+    costLine += th.fg("dim", ` (in: ${formatTokens(st.costs.inputTokens)}`);
+    costLine += th.fg("dim", ` out: ${formatTokens(st.costs.outputTokens)}`);
+    costLine += th.fg("dim", ` cache-r: ${formatTokens(st.costs.cacheReadTokens)}`);
+    costLine += th.fg("dim", ` cache-w: ${formatTokens(st.costs.cacheWriteTokens)})`);
+    lines.push(truncateToWidth(costLine, width));
   }
 
   lines.push("");
@@ -745,6 +815,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               continue;
             }
 
+            // Cost summary line from a worker session
+            if (entry.type === "cost") {
+              state.costs = addCosts(state.costs, {
+                totalCost: entry.totalCost ?? 0,
+                inputTokens: entry.inputTokens ?? 0,
+                outputTokens: entry.outputTokens ?? 0,
+                cacheReadTokens: entry.cacheReadTokens ?? 0,
+                cacheWriteTokens: entry.cacheWriteTokens ?? 0,
+              });
+              continue;
+            }
+
             // Experiment result line
             state.results.push({
               commit: entry.commit ?? "",
@@ -806,6 +888,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     // Read max experiments from config file
     state.maxExperiments = readMaxExperiments(ctx.cwd);
+
+    // Add this session's own costs (live, not persisted — covers orchestrator costs)
+    try {
+      const ownCosts = computeCostsFromEntries(ctx.sessionManager.getEntries() as any);
+      state.costs = addCosts(state.costs, ownCosts);
+    } catch {
+      // Best effort
+    }
 
     // Auto-enter autoresearch mode only when a persisted experiment log exists
     runtime.autoresearchMode = fs.existsSync(path.join(workDir, "autoresearch.jsonl"));
@@ -966,6 +1056,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           }
         }
 
+        // Cost summary
+        if (state.costs.totalCost > 0) {
+          const totalTokens = state.costs.inputTokens + state.costs.outputTokens + state.costs.cacheReadTokens + state.costs.cacheWriteTokens;
+          parts.push(theme.fg("dim", " │ "));
+          parts.push(theme.fg("muted", `${formatCost(state.costs.totalCost)} ${formatTokens(totalTokens)} tokens`));
+        }
+
         if (state.name) {
           parts.push(theme.fg("dim", ` │ ${state.name}`));
         }
@@ -985,6 +1082,28 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     clearOverlay();
   });
   pi.on("session_shutdown", async (_e, ctx) => {
+    const runtime = getRuntime(ctx);
+
+    // Write cost summary to jsonl when a worker session shuts down
+    if (runtime.autoresearchMode && !runtime.isOrchestrator && runtime.experimentsThisSession > 0) {
+      try {
+        const workDir = resolveWorkDir(ctx.cwd);
+        const jsonlPath = path.join(workDir, "autoresearch.jsonl");
+        const costs = computeCostsFromEntries(ctx.sessionManager.getEntries() as any);
+        if (costs.totalCost > 0 || costs.inputTokens > 0) {
+          const costEntry = JSON.stringify({
+            type: "cost",
+            sessionId: ctx.sessionManager.getSessionId(),
+            timestamp: Date.now(),
+            ...costs,
+          });
+          fs.appendFileSync(jsonlPath, costEntry + "\n");
+        }
+      } catch {
+        // Best effort — don't block shutdown
+      }
+    }
+
     clearSessionUi(ctx);
     runtimeStore.clear(getSessionKey(ctx));
   });
