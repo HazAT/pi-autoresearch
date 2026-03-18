@@ -652,6 +652,10 @@ function createSessionRuntime(): AutoresearchRuntime {
 
 function createRuntimeStore() {
   const runtimes = new Map<string, AutoresearchRuntime>();
+  /** File-polling intervals per session key */
+  const pollers = new Map<string, ReturnType<typeof setInterval>>();
+  /** Last known file size per session key (to detect changes) */
+  const lastFileSizes = new Map<string, number>();
 
   return {
     ensure(sessionKey: string): AutoresearchRuntime {
@@ -665,6 +669,45 @@ function createRuntimeStore() {
 
     clear(sessionKey: string): void {
       runtimes.delete(sessionKey);
+      this.stopPolling(sessionKey);
+    },
+
+    /** Start polling autoresearch.jsonl for external changes (e.g. from worker subagents) */
+    startPolling(sessionKey: string, jsonlPath: string, onChanged: () => void): void {
+      // Don't double-poll
+      if (pollers.has(sessionKey)) return;
+
+      // Seed the last known size
+      try {
+        const stat = fs.statSync(jsonlPath);
+        lastFileSizes.set(sessionKey, stat.size);
+      } catch {
+        lastFileSizes.set(sessionKey, 0);
+      }
+
+      const interval = setInterval(() => {
+        try {
+          const stat = fs.statSync(jsonlPath);
+          const lastSize = lastFileSizes.get(sessionKey) ?? 0;
+          if (stat.size !== lastSize) {
+            lastFileSizes.set(sessionKey, stat.size);
+            onChanged();
+          }
+        } catch {
+          // File might not exist yet — ignore
+        }
+      }, 3000); // Poll every 3 seconds
+
+      pollers.set(sessionKey, interval);
+    },
+
+    stopPolling(sessionKey: string): void {
+      const interval = pollers.get(sessionKey);
+      if (interval) {
+        clearInterval(interval);
+        pollers.delete(sessionKey);
+      }
+      lastFileSizes.delete(sessionKey);
     },
   };
 }
@@ -1154,6 +1197,34 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     // Auto-enter autoresearch mode only when a persisted experiment log exists
     runtime.autoresearchMode = fs.existsSync(path.join(workDir, "autoresearch.jsonl"));
+
+    // Start/stop file polling based on autoresearch mode
+    const sessionKey = getSessionKey(ctx);
+    if (runtime.autoresearchMode) {
+      runtimeStore.startPolling(sessionKey, jsonlPath, () => {
+        // Re-read state from jsonl without resetting session-specific fields
+        const prevExperimentsThisSession = runtime.experimentsThisSession;
+        const prevAutoResumeTurns = runtime.autoResumeTurns;
+        const prevLastAutoResumeTime = runtime.lastAutoResumeTime;
+        const prevIsOrchestrator = runtime.isOrchestrator;
+        const prevDashboardExpanded = runtime.dashboardExpanded;
+        const prevRunningExperiment = runtime.runningExperiment;
+        const prevLastRunChecks = runtime.lastRunChecks;
+
+        reconstructState(ctx);
+
+        // Restore session-specific fields that shouldn't be reset by polling
+        runtime.experimentsThisSession = prevExperimentsThisSession;
+        runtime.autoResumeTurns = prevAutoResumeTurns;
+        runtime.lastAutoResumeTime = prevLastAutoResumeTime;
+        runtime.isOrchestrator = prevIsOrchestrator;
+        runtime.dashboardExpanded = prevDashboardExpanded;
+        runtime.runningExperiment = prevRunningExperiment;
+        runtime.lastRunChecks = prevLastRunChecks;
+      });
+    } else {
+      runtimeStore.stopPolling(sessionKey);
+    }
 
     updateWidget(ctx);
   };
@@ -2877,6 +2948,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         runtime.lastRunChecks = null;
         runtime.runningExperiment = null;
         stopDashboardServer();
+        runtimeStore.stopPolling(getSessionKey(ctx));
         ctx.ui.notify("Autoresearch mode OFF", "info");
         return;
       }
@@ -2889,6 +2961,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (command === "clear") {
         const jsonlPath = path.join(resolveWorkDir(ctx.cwd), "autoresearch.jsonl");
         runtime.autoresearchMode = false;
+        runtimeStore.stopPolling(getSessionKey(ctx));
         runtime.dashboardExpanded = false;
         runtime.lastAutoResumeTime = 0;
         runtime.autoResumeTurns = 0;
