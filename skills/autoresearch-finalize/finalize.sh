@@ -64,17 +64,18 @@ parse_groups() {
   DATA_DIR=$(mktemp -d)
   node -e "
 const fs = require('fs');
-const g = JSON.parse(fs.readFileSync('$groups_file', 'utf-8'));
-fs.writeFileSync('$DATA_DIR/base', g.base);
-fs.writeFileSync('$DATA_DIR/trunk', g.trunk || 'main');
-fs.writeFileSync('$DATA_DIR/final_tree', g.final_tree);
-fs.writeFileSync('$DATA_DIR/goal', g.goal);
-fs.writeFileSync('$DATA_DIR/count', String(g.groups.length));
-g.groups.forEach((x, i) => {
-  fs.writeFileSync('$DATA_DIR/' + i + '.title', x.title);
-  fs.writeFileSync('$DATA_DIR/' + i + '.body', x.body);
-  fs.writeFileSync('$DATA_DIR/' + i + '.last_commit', x.last_commit);
-  fs.writeFileSync('$DATA_DIR/' + i + '.slug', x.slug);
+const config = JSON.parse(fs.readFileSync('$groups_file', 'utf-8'));
+const outDir = '$DATA_DIR';
+fs.writeFileSync(outDir + '/base', config.base);
+fs.writeFileSync(outDir + '/trunk', config.trunk || 'main');
+fs.writeFileSync(outDir + '/final_tree', config.final_tree);
+fs.writeFileSync(outDir + '/goal', config.goal);
+fs.writeFileSync(outDir + '/count', String(config.groups.length));
+config.groups.forEach((group, idx) => {
+  fs.writeFileSync(outDir + '/' + idx + '.title', group.title);
+  fs.writeFileSync(outDir + '/' + idx + '.body', group.body);
+  fs.writeFileSync(outDir + '/' + idx + '.last_commit', group.last_commit);
+  fs.writeFileSync(outDir + '/' + idx + '.slug', group.slug);
 });
 " || fail "Failed to parse $groups_file — check JSON syntax."
 
@@ -101,32 +102,33 @@ assert_commits_exist() {
 }
 
 collect_group_files() {
-  local i="$1" prev_commit="$2"
-  local last_commit all_group_files files
+  local group_index="$1" prev_commit="$2"
+  local last_commit
 
-  last_commit=$(cat "$DATA_DIR/$i.last_commit")
-  git rev-parse "$last_commit" >/dev/null 2>&1 \
-    || fail "Group $((i+1)) last_commit $last_commit not found. Use full hashes (git rev-parse <short>)."
+  last_commit=$(cat "$DATA_DIR/$group_index.last_commit")
+  # rev-parse accepts any hex string; cat-file verifies the object exists.
+  git cat-file -t "$last_commit" 2>/dev/null | grep -q "commit" \
+    || fail "Group $((group_index+1)) last_commit $last_commit not found. Use full hashes (git rev-parse <short>)."
 
-  if ! all_group_files=$(git diff --name-only "$prev_commit" "$last_commit" 2>&1); then
-    fail "git diff failed for group $((i+1)): $all_group_files"
-  fi
-
-  files=""
-  for f in $all_group_files; do
-    is_session_file "$f" || files=$(printf '%s\n%s' "$files" "$f")
-  done
-  echo "$files" | sed '/^$/d' > "$DATA_DIR/$i.files"
-  cat "$DATA_DIR/$i.files"
+  # NUL-delimited (-z) via process substitution to handle spaces/globs in filenames.
+  local changed_file
+  : > "$DATA_DIR/$group_index.files"
+  while IFS= read -r -d '' changed_file; do
+    [ -n "$changed_file" ] || continue
+    is_session_file "$changed_file" || echo "$changed_file" >> "$DATA_DIR/$group_index.files"
+  done < <(git diff --name-only -z "$prev_commit" "$last_commit")
 }
 
 assert_no_overlapping_files() {
-  local new_files="$1" all_seen="$2"
-  for f in $new_files; do
-    if echo "$all_seen" | grep -qxF "$f"; then
-      fail "File '$f' appears in multiple groups. Merge the overlapping groups and retry."
+  local new_files_path="$1" seen_files_path="$2"
+  [ -s "$new_files_path" ] || return 0
+  [ -s "$seen_files_path" ] || return 0
+  local candidate
+  while IFS= read -r candidate; do
+    if grep -qxF "$candidate" "$seen_files_path"; then
+      fail "File '$candidate' appears in multiple groups. Merge the overlapping groups and retry."
     fi
-  done
+  done < "$new_files_path"
 }
 
 assert_branch_available() {
@@ -145,19 +147,13 @@ preflight() {
   assert_commits_exist
 
   local prev_commit="$BASE"
-  local all_files_seen=""
+  local all_seen_path="$DATA_DIR/all_seen_files"
+  : > "$all_seen_path"
 
   for i in $(seq 0 $((GROUP_COUNT - 1))); do
-    local files
-    files=$(collect_group_files "$i" "$prev_commit")
-
-    assert_no_overlapping_files "$files" "$all_files_seen"
-
-    if [ -z "$all_files_seen" ]; then
-      all_files_seen="$files"
-    else
-      all_files_seen=$(printf '%s\n%s' "$all_files_seen" "$files")
-    fi
+    collect_group_files "$i" "$prev_commit"
+    assert_no_overlapping_files "$DATA_DIR/$i.files" "$all_seen_path"
+    cat "$DATA_DIR/$i.files" >> "$all_seen_path"
 
     local group_number branch_name
     group_number=$(printf "%02d" $((i + 1)))
@@ -194,7 +190,8 @@ rollback_on_failure() {
     git checkout "$ORIG_BRANCH" --quiet 2>/dev/null || true
   fi
   if [ "$STASHED" = true ]; then
-    git stash pop --quiet 2>/dev/null || true
+    git stash pop --quiet 2>/dev/null \
+      || echo -e "${YELLOW}⚠ Could not restore stashed changes. Run 'git stash list' to recover.${NC}"
   fi
   cleanup_data
   echo -e "${RED}Rolled back to '$ORIG_BRANCH'. No branches left behind.${NC}"
@@ -218,14 +215,14 @@ create_group_branch() {
   body=$(cat "$DATA_DIR/$i.body")
   last_commit=$(cat "$DATA_DIR/$i.last_commit")
   slug=$(cat "$DATA_DIR/$i.slug")
-  files=$(cat "$DATA_DIR/$i.files")
+  local files_path="$DATA_DIR/$i.files"
 
   group_number=$(printf "%02d" $((i + 1)))
   branch_name="autoresearch/${GOAL}/${group_number}-${slug}"
 
   info "[$group_number/$GROUP_COUNT] $title"
 
-  if [ -z "$files" ]; then
+  if [ ! -s "$files_path" ]; then
     warn "No files changed — skipping this group"
     GROUP_BRANCH[$i]="skipped"
     return
@@ -236,15 +233,16 @@ create_group_branch() {
   git checkout "$BASE" --quiet --detach 2>/dev/null || git checkout "$BASE" --quiet
   git checkout -b "$branch_name"
 
-  for changed_file in $files; do
+  while IFS= read -r changed_file; do
+    [ -n "$changed_file" ] || continue
     git checkout "$last_commit" -- "$changed_file"
-  done
+  done < "$files_path"
   git commit -m "$title" -m "$body"
 
   CREATED_BRANCHES+=("$branch_name")
   GROUP_BRANCH[$i]="$branch_name"
   echo "  Branch: $branch_name"
-  echo "  Files: $files"
+  echo "  Files: $(tr '\n' ' ' < "$files_path")"
   echo ""
 }
 
@@ -279,12 +277,12 @@ verify_union_matches_original() {
   git checkout -b "$verify_branch"
 
   for i in $(seq 0 $((GROUP_COUNT - 1))); do
-    local files last_commit
-    files=$(cat "$DATA_DIR/$i.files")
+    local last_commit
     last_commit=$(cat "$DATA_DIR/$i.last_commit")
-    for changed_file in $files; do
+    while IFS= read -r changed_file; do
+      [ -n "$changed_file" ] || continue
       git checkout "$last_commit" -- "$changed_file"
-    done
+    done < "$DATA_DIR/$i.files"
   done
   # --allow-empty: when all groups cover all files, the checkout leaves
   # nothing staged — the diff against FINAL_TREE is what matters, not this commit.
@@ -391,16 +389,15 @@ print_summary() {
 
   echo "Branches:"
   for i in $(seq 0 $((GROUP_COUNT - 1))); do
-    local title body branch files group_number
+    local title body branch group_number
     title=$(cat "$DATA_DIR/$i.title")
     body=$(cat "$DATA_DIR/$i.body")
     branch="${GROUP_BRANCH[$i]:-skipped}"
-    files=$(cat "$DATA_DIR/$i.files")
     group_number=$(printf "%02d" $((i + 1)))
     echo ""
     echo "  $group_number. $title"
     echo "     Branch: $branch"
-    echo "     Files: $(echo $files | tr '\n' ' ')"
+    echo "     Files: $(tr '\n' ' ' < "$DATA_DIR/$i.files")"
     echo ""
     echo "$body" | sed 's/^/     /'
   done

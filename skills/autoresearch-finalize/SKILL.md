@@ -69,7 +69,7 @@ Then run:
 bash <SKILL_DIR>/finalize.sh /tmp/groups.json
 ```
 
-The script creates one branch per group from the merge-base, verifies the union matches the original branch, and writes `autoresearch-finalize-summary.md` with all branches, cleanup commands, and any ideas from `autoresearch.ideas.md`.
+The script creates one branch per group from the merge-base, verifies the union matches the original branch, and prints a summary with all branches, cleanup commands, and any ideas from `autoresearch.ideas.md`.
 
 On creation failure: rolls back (deletes branches, restores original branch, pops stash).
 On verification failure: exits non-zero but leaves branches intact for inspection.
@@ -79,7 +79,7 @@ On verification failure: exits non-zero but leaves branches intact for inspectio
 After the script finishes, report to the user:
 - Branches created and what each contains
 - Overall metric improvement (baseline → best)
-- Point them to `autoresearch-finalize-summary.md` for cleanup instructions
+- Show the cleanup commands from the script's summary output
 
 ## Edge Cases
 
