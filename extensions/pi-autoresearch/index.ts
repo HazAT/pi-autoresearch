@@ -1493,16 +1493,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             }
           }
 
-        // Cost summary
-        if (state.costs.totalCost > 0) {
-          const totalTokens = state.costs.inputTokens + state.costs.outputTokens + state.costs.cacheReadTokens + state.costs.cacheWriteTokens;
-          parts.push(theme.fg("dim", " │ "));
-          parts.push(theme.fg("muted", `${formatCost(state.costs.totalCost)} ${formatTokens(totalTokens)} tokens`));
-        }
+          // Cost summary
+          if (state.costs.totalCost > 0) {
+            const totalTokens = state.costs.inputTokens + state.costs.outputTokens + state.costs.cacheReadTokens + state.costs.cacheWriteTokens;
+            optional.push(theme.fg("dim", " │ "));
+            optional.push(theme.fg("muted", `${formatCost(state.costs.totalCost)} ${formatTokens(totalTokens)} tokens`));
+          }
 
-        if (state.name) {
-          parts.push(theme.fg("dim", ` │ ${state.name}`));
-        }
+          if (state.name) {
+            optional.push(theme.fg("dim", ` │ ${state.name}`));
+          }
 
           const left = [...essential, ...optional].join("");
           return [
