@@ -11,7 +11,7 @@ Autonomous experiment loop: try ideas, keep what works, discard what doesn't, ne
 
 - **`init_experiment`** — configure session (name, metric, unit, direction). Call again to re-initialize with a new baseline when the optimization target changes.
 - **`run_experiment`** — runs command, times it, captures output.
-- **`log_experiment`** — records result. `keep` auto-commits. `discard`/`crash`/`checks_failed` auto-reverts code changes (autoresearch files preserved). Always include secondary `metrics` dict. Dashboard: ctrl+x.
+- **`log_experiment`** — records result. `keep` auto-commits. `discard`/`crash`/`checks_failed` auto-reverts code changes (autoresearch files preserved). Always include secondary `metrics` dict. Dashboard: ctrl+shift+d.
 
 ## Setup
 
@@ -118,19 +118,23 @@ pnpm test --run --reporter=dot 2>&1 | tail -50
 pnpm typecheck 2>&1 | grep -i error || true
 ```
 
-## Architecture: Orchestrator + Workers
+## Architecture: Orchestrator + Workers (Solo)
 
-Autoresearch runs via **subagent workers**. The parent session (orchestrator) spawns autonomous worker subagents using the `autoresearch` agent definition. Each worker:
+Autoresearch runs via **Solo subagent workers**. The parent session (orchestrator, on the strongest available **Opus**) spawns autonomous worker subagents using the `autoresearch` agent definition. Each worker:
 
-1. Gets a fresh context window (Opus 4.6, medium thinking)
+1. Gets a fresh context window (**Sonnet**, medium thinking)
 2. Reads `autoresearch.md` + git log for full context
 3. Runs a batch of experiments (default 10, configurable via `experimentsPerWorker` in config)
 4. Updates `autoresearch.md` "What's Been Tried" and `autoresearch.ideas.md`
-5. Self-terminates via `subagent_done`
+5. Writes a batch summary to its Solo scratchpad, then goes idle (`auto-exit`)
 
-The orchestrator then spawns the next worker. This gives unlimited experiment runs with fresh thinking each batch.
+`subagent` is fire-and-forget. When the worker goes idle, Solo wakes the orchestrator with the worker's process id and scratchpad id. The orchestrator reads that scratchpad, then spawns the next worker. Workers run **one at a time** (they share the git repo). This gives unlimited experiment runs with fresh thinking each batch.
 
-**Setup happens in the orchestrator** (creating files, initial commit). Once setup is done, the orchestrator spawns the first worker and enters the spawn loop.
+```typescript
+subagent({ name: "Autoresearch", agent: "autoresearch", scratchpad: true, task: "Run a batch of autoresearch experiments. Read autoresearch.md and git log --oneline -20." })
+```
+
+**Setup happens in the orchestrator** (creating files, initial commit). Once setup is done, the orchestrator spawns the first worker and enters the spawn loop. The orchestrator model is set best-effort to Opus when `/autoresearch` starts — if no Opus is available it stays on the current model.
 
 ## Loop Rules
 

@@ -8,7 +8,7 @@
  * - `run_experiment` tool — runs any command, times it, captures output, detects pass/fail
  * - `log_experiment` tool — records results with session-persisted state
  * - Status widget showing experiment count + best metric
- * - Ctrl+X toggle to expand/collapse full dashboard inline above the editor
+ * - Ctrl+Shift+D toggle to expand/collapse full dashboard inline above the editor
  * - Adds autoresearch guidance to the system prompt and points the agent at autoresearch.md
  * - Injects autoresearch.md into context on every turn via before_agent_start
  */
@@ -979,8 +979,8 @@ function renderDashboardLines(
     headerHint
       ? appendRightAlignedAdaptiveHint(headerLine, width, th, [
           headerHint,
-          "ctrl+x collapse • full: c-s-x",
-          "ctrl+x • c-s-x",
+          "c-s-d collapse • full: c-s-x",
+          "c-s-d • c-s-x",
         ])
       : truncateToWidth(headerLine, width, "…", true)
   );
@@ -1095,6 +1095,44 @@ function renderDashboardLines(
 export default function autoresearchExtension(pi: ExtensionAPI) {
   const BENCHMARK_GUARDRAIL =
     "Be careful not to overfit to the benchmarks and do not cheat on the benchmarks.";
+
+  // Preferred orchestrator models, strongest first. Workers run on Sonnet
+  // (set in the 'autoresearch' agent definition); the orchestrator should run
+  // on the strongest available Opus. Matched by substring against model ids
+  // across whatever providers are configured (anthropic, openrouter, etc.).
+  const ORCHESTRATOR_MODEL_PREFERENCES = [
+    "claude-opus-4.8",
+    "claude-opus-4.7",
+    "claude-opus-4.6",
+    "claude-opus-4.5",
+    "claude-opus",
+  ];
+
+  /**
+   * Best-effort: switch the orchestrator (parent) session to the strongest
+   * available Opus model. Never throws — if no Opus is available or the switch
+   * fails, autoresearch continues on the current model.
+   */
+  const ensureOrchestratorModel = async (ctx: ExtensionContext): Promise<void> => {
+    try {
+      const current = ctx.model;
+      if (current && /opus/i.test(current.id)) return; // already on Opus
+
+      const available = ctx.modelRegistry.getAvailable();
+      for (const pref of ORCHESTRATOR_MODEL_PREFERENCES) {
+        const match = available.find((m) => m.id.includes(pref) && !m.id.includes("fast"))
+          ?? available.find((m) => m.id.includes(pref));
+        if (!match) continue;
+        const ok = await pi.setModel(match);
+        if (ok) {
+          ctx.ui.notify(`Orchestrator model: ${match.name}`, "info");
+          return;
+        }
+      }
+    } catch {
+      // Best effort — keep current model.
+    }
+  };
 
   const runtimeStore = createRuntimeStore();
   const getSessionKey = (ctx: ExtensionContext) => ctx.sessionManager.getSessionId();
@@ -1367,7 +1405,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               safeWidth,
               theme,
               rows,
-              "ctrl+x collapse • ctrl+shift+x fullscreen"
+              "ctrl+shift+d collapse • ctrl+shift+x fullscreen"
             ),
           ];
         },
@@ -1469,9 +1507,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const left = [...essential, ...optional].join("");
           return [
             appendRightAlignedAdaptiveHint(left, safeWidth, theme, [
-              "ctrl+x expand • ctrl+shift+x fullscreen",
-              "ctrl+x expand • full: c-s-x",
-              "ctrl+x • c-s-x",
+              "ctrl+shift+d expand • ctrl+shift+x fullscreen",
+              "c-s-d expand • full: c-s-x",
+              "c-s-d • c-s-x",
             ]),
           ];
         },
@@ -1550,17 +1588,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       extra =
         "\n\n## Autoresearch Mode (ACTIVE — Orchestrator)" +
-        "\nYou orchestrate autoresearch by spawning worker subagents. Do NOT run experiments yourself." +
+        "\nYou orchestrate autoresearch by spawning Solo worker subagents. Do NOT run experiments yourself." +
         `\nExperiment rules: ${mdPath}` +
         `\n${BENCHMARK_GUARDRAIL}` +
-        "\n\n### How to spawn a worker" +
-        "\nUse the subagent tool with agent 'autoresearch':" +
+        "\n\n### How to spawn a worker (Solo)" +
+        "\nUse the subagent tool with agent 'autoresearch' and scratchpad: true so Solo pre-creates the worker's result artifact:" +
         '\n```' +
-        `\nsubagent({ name: "Autoresearch", agent: "autoresearch", interactive: false, task: "Run autoresearch experiments. Read autoresearch.md for full context, git log --oneline -20 for recent history. ${BENCHMARK_GUARDRAIL}" })` +
+        `\nsubagent({ name: "Autoresearch", agent: "autoresearch", scratchpad: true, task: "Run a batch of autoresearch experiments. Read autoresearch.md for full context and git log --oneline -20 for recent history. ${BENCHMARK_GUARDRAIL}" })` +
         '\n```' +
-        `\nEach worker runs up to ${batchSize} experiments, then self-terminates.` +
-        "\nWhen a worker completes, review its summary and spawn the next worker." +
-        "\nContinue spawning workers until /autoresearch off or the experiment limit is reached." +
+        `\nEach worker (Sonnet) runs up to ${batchSize} experiments, writes a batch summary to its Solo scratchpad, then goes idle (auto-exit).` +
+        "\nsubagent is fire-and-forget: it returns after launching the worker. Do NOT poll. When the worker goes idle, Solo wakes you with the worker's process id and scratchpad id." +
+        "\nOn wake-up: read the worker's scratchpad with scratchpad_read to review what it tried and the current best, then spawn the next worker." +
+        "\nContinue spawning workers one at a time (they share the git repo — never run two in parallel) until /autoresearch off or the experiment limit is reached." +
         `\n\nCurrent progress: ${segCount} experiments` +
         (state.maxExperiments !== null ? ` / ${state.maxExperiments} max` : "") +
         (state.bestMetric !== null ? ` | best ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}` : "") +
@@ -1579,7 +1618,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         "\nWrite promising but deferred optimizations as bullet points to autoresearch.ideas.md — don't let good ideas get lost." +
         `\n${BENCHMARK_GUARDRAIL}` +
         "\nIf the user sends a follow-on message while an experiment is running, finish the current run_experiment + log_experiment cycle first, then address their message in the next iteration." +
-        "\nWhen log_experiment tells you the batch is complete, follow its wrap-up instructions and call subagent_done.";
+        "\nWhen log_experiment tells you the batch is complete, follow its wrap-up instructions: update autoresearch.md and autoresearch.ideas.md, write a batch summary to your Solo scratchpad, then stop (the orchestrator spawns the next worker).";
 
       if (hasChecks) {
         extra +=
@@ -2511,7 +2550,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           text += `\n\n🔄 Batch complete (${batchLimit} experiments). Time to wrap up:` +
             "\n1. Update autoresearch.md — add key findings to 'What's Been Tried'" +
             "\n2. Write promising untried ideas to autoresearch.ideas.md" +
-            "\n3. Call subagent_done with a summary of this batch (what you tried, what worked, current best)";
+            "\n3. Write a batch summary to your Solo scratchpad (scratchpad_write): what you tried, what worked, current best metric, and promising next directions" +
+            "\n4. Stop — do NOT start another experiment. Your final message should reference the scratchpad. The orchestrator will spawn the next worker.";
         }
       }
 
@@ -2607,10 +2647,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   // -----------------------------------------------------------------------
-  // Ctrl+X — toggle dashboard expand/collapse
+  // Ctrl+Shift+D — toggle dashboard expand/collapse
   // -----------------------------------------------------------------------
 
-  pi.registerShortcut("ctrl+x", {
+  pi.registerShortcut("ctrl+shift+d", {
     description: "Toggle autoresearch dashboard",
     handler: async (ctx) => {
       const runtime = getRuntime(ctx);
@@ -3076,6 +3116,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       reconstructState(ctx);
       runtime.autoresearchMode = true;
       runtime.isOrchestrator = true;
+
+      // Best-effort: run the orchestrator on the strongest available Opus.
+      await ensureOrchestratorModel(ctx);
 
       const mdPath = path.join(resolveWorkDir(ctx.cwd), "autoresearch.md");
       const hasRules = fs.existsSync(mdPath);
