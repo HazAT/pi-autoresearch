@@ -63,15 +63,16 @@ pi install https://github.com/davebcn87/pi-autoresearch
 
 | Shortcut | Description |
 |----------|-------------|
-| `Ctrl+Shift+D` | Toggle dashboard expand/collapse (inline widget ↔ full results table above the editor) |
+| `Ctrl+Shift+E` | Toggle dashboard expand/collapse (inline widget ↔ full results table above the editor) |
 | `Ctrl+Shift+X` | Open fullscreen scrollable dashboard overlay. Navigate with `↑`/`↓`/`j`/`k`, `PageUp`/`PageDown`/`u`/`d`, `g`/`G` for top/bottom, `Escape` or `q` to close. |
 
 ### UI
 
 - **Status widget** — always visible above the editor: `🔬 autoresearch 12 runs 8 kept │ ★ total_µs: 15,200 (-12.3%) │ conf: 2.1×`
 - **Confidence score** — after 3+ runs, shows how the best improvement compares to the session noise floor. ≥2.0× (green) = likely real, 1.0–2.0× (yellow) = above noise but marginal, <1.0× (red) = within noise.
-- **Expanded dashboard** — `Ctrl+Shift+D` expands the widget into a full results table with columns for commit, metric, status, and description.
+- **Expanded dashboard** — `Ctrl+Shift+E` expands the widget into a full results table with columns for commit, metric, status, and description.
 - **Fullscreen overlay** — `Ctrl+Shift+X` opens a scrollable full-terminal dashboard. Shows a live spinner with elapsed time for running experiments.
+- **Live progress file** — while an experiment runs, `autoresearch.progress.md` is written to the working directory and refreshed every second with the current experiment number, command, elapsed time, and the latest output. It is removed automatically when the run finishes, so it only exists while an experiment is in flight (useful for tailing progress from another terminal: `tail -f autoresearch.progress.md`).
 
 ### Skills
 
@@ -139,7 +140,7 @@ The agent reads `autoresearch.jsonl`, groups kept experiments into logical chang
 ### 4. Monitor progress
 
 - **Widget** — always visible above the editor
-- **`Ctrl+Shift+D`** — expand/collapse the full results table inline
+- **`Ctrl+Shift+E`** — expand/collapse the full results table inline
 - **`Ctrl+Shift+X`** — fullscreen scrollable dashboard overlay
 - **`/autoresearch export`** — open a live browser dashboard with chart and share card
 - **`Escape`** — interrupt anytime and ask for a summary

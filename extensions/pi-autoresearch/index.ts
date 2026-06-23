@@ -8,7 +8,7 @@
  * - `run_experiment` tool — runs any command, times it, captures output, detects pass/fail
  * - `log_experiment` tool — records results with session-persisted state
  * - Status widget showing experiment count + best metric
- * - Ctrl+Shift+D toggle to expand/collapse full dashboard inline above the editor
+ * - Ctrl+Shift+E toggle to expand/collapse full dashboard inline above the editor
  * - Adds autoresearch guidance to the system prompt and points the agent at autoresearch.md
  * - Injects autoresearch.md into context on every turn via before_agent_start
  */
@@ -307,6 +307,46 @@ function formatElapsed(ms: number): string {
   const s = totalSec % 60;
   if (m > 0) return `${m}m ${String(s).padStart(2, "0")}s`;
   return `${s}s`;
+}
+
+/** Filename for the live progress file written while an experiment runs. */
+const PROGRESS_FILENAME = "autoresearch.progress.md";
+
+/**
+ * Write a live snapshot of the currently running experiment to
+ * autoresearch.progress.md in the working directory. Best-effort: never
+ * throws. Overwritten every second during run_experiment and removed when the
+ * run completes, so the file exists only while an experiment is in flight.
+ */
+function writeProgressFile(
+  workDir: string,
+  info: { run: number; command: string; elapsed: string; phase: string; tail: string }
+): void {
+  try {
+    const body =
+      `# Autoresearch — live progress\n\n` +
+      `- **Status:** ${info.phase}\n` +
+      `- **Experiment:** #${info.run}\n` +
+      `- **Command:** \`${info.command}\`\n` +
+      `- **Elapsed:** ${info.elapsed}\n` +
+      `- **Updated:** ${new Date().toISOString()}\n\n` +
+      `## Latest output\n\n` +
+      "```\n" +
+      (info.tail.trim() || "(no output yet)") +
+      "\n```\n";
+    fs.writeFileSync(path.join(workDir, PROGRESS_FILENAME), body);
+  } catch {
+    // Best effort — progress reporting must never break an experiment.
+  }
+}
+
+/** Remove the live progress file once a run finishes. Best-effort. */
+function clearProgressFile(workDir: string): void {
+  try {
+    fs.rmSync(path.join(workDir, PROGRESS_FILENAME), { force: true });
+  } catch {
+    // Best effort.
+  }
 }
 
 /** Kill a process tree (best effort, tries process group first) */
@@ -979,8 +1019,8 @@ function renderDashboardLines(
     headerHint
       ? appendRightAlignedAdaptiveHint(headerLine, width, th, [
           headerHint,
-          "c-s-d collapse • full: c-s-x",
-          "c-s-d • c-s-x",
+          "c-s-e collapse • full: c-s-x",
+          "c-s-e • c-s-x",
         ])
       : truncateToWidth(headerLine, width, "…", true)
   );
@@ -1405,7 +1445,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               safeWidth,
               theme,
               rows,
-              "ctrl+shift+d collapse • ctrl+shift+x fullscreen"
+              "ctrl+shift+e collapse • ctrl+shift+x fullscreen"
             ),
           ];
         },
@@ -1507,9 +1547,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const left = [...essential, ...optional].join("");
           return [
             appendRightAlignedAdaptiveHint(left, safeWidth, theme, [
-              "ctrl+shift+d expand • ctrl+shift+x fullscreen",
-              "c-s-d expand • full: c-s-x",
-              "c-s-d • c-s-x",
+              "ctrl+shift+e expand • ctrl+shift+x fullscreen",
+              "c-s-e expand • full: c-s-x",
+              "c-s-e • c-s-x",
             ]),
           ];
         },
@@ -1831,6 +1871,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (overlayTui) overlayTui.requestRender();
 
       const t0 = Date.now();
+      const progressRun = currentResults(state.results, state.currentSegment).length + 1;
+      writeProgressFile(workDir, {
+        run: progressRun,
+        command: params.command,
+        elapsed: "0s",
+        phase: "running",
+        tail: "",
+      });
 
       // Spawn the process directly (like the bash tool) for streaming output
       const getTempFile = createTempFileAllocator();
@@ -1873,12 +1921,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
         // Timer interval — update every second with elapsed time + tail output
         const timerInterval = setInterval(() => {
-          if (!onUpdate) return;
           const elapsed = formatElapsed(Date.now() - t0);
           const trunc = truncateTail(getBufferText(), {
             maxLines: DEFAULT_MAX_LINES,
             maxBytes: DEFAULT_MAX_BYTES,
           });
+          writeProgressFile(workDir, {
+            run: progressRun,
+            command: params.command,
+            elapsed,
+            phase: "running",
+            tail: trunc.content || "",
+          });
+          if (!onUpdate) return;
           onUpdate({
             content: [{ type: "text", text: trunc.content || "" }],
             details: {
@@ -1992,6 +2047,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         });
       }).finally(() => {
         runtime.runningExperiment = null;
+        clearProgressFile(workDir);
         updateWidget(ctx);
         if (overlayTui) overlayTui.requestRender();
       });
@@ -2518,7 +2574,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Auto-revert on discard/crash/checks_failed — revert all files except autoresearch session files
       if (params.status !== "keep") {
         try {
-          const protectedFiles = ["autoresearch.jsonl", "autoresearch.md", "autoresearch.ideas.md", "autoresearch.sh", "autoresearch.checks.sh"];
+          const protectedFiles = ["autoresearch.jsonl", "autoresearch.md", "autoresearch.ideas.md", "autoresearch.sh", "autoresearch.checks.sh", PROGRESS_FILENAME];
           const stageCmd = protectedFiles.map((f) => `git add "${path.join(workDir, f)}" 2>/dev/null || true`).join("; ");
           await pi.exec("bash", ["-c", `${stageCmd}; git checkout -- .; git clean -fd 2>/dev/null`], { cwd: workDir, timeout: 10000 });
           text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
@@ -2647,10 +2703,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   // -----------------------------------------------------------------------
-  // Ctrl+Shift+D — toggle dashboard expand/collapse
+  // Ctrl+Shift+E — toggle dashboard expand/collapse
   // -----------------------------------------------------------------------
 
-  pi.registerShortcut("ctrl+shift+d", {
+  pi.registerShortcut("ctrl+shift+e", {
     description: "Toggle autoresearch dashboard",
     handler: async (ctx) => {
       const runtime = getRuntime(ctx);
